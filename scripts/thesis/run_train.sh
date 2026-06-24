@@ -67,5 +67,19 @@ if [[ $train_status -ne 0 ]]; then
   exit "$train_status"
 fi
 
+METRICS_SCRIPT="$PROJECT_ROOT/scripts/thesis/collect_metrics.py"
+
+if [[ -f "$METRICS_SCRIPT" ]]; then
+  if python "$METRICS_SCRIPT" \
+    "$RECORD_DIR/launcher_console.log" \
+    --output "$RECORD_DIR/summary.csv"; then
+    echo "[OK] 已生成训练指标：$RECORD_DIR/summary.csv"
+  else
+    echo "[WARN] 训练完成，但指标提取失败。"
+  fi
+else
+  echo "[WARN] 未找到指标提取脚本：$METRICS_SCRIPT"
+fi
+
 echo "[OK] 训练命令执行完成。"
 echo "[OK] 实验记录：$RECORD_DIR"
