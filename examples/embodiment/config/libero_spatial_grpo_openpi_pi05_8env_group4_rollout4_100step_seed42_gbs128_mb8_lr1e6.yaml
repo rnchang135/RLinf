@@ -20,7 +20,7 @@ runner:
   logger:
     log_path: ../results
     project_name: rlinf
-    experiment_name: libero_spatial_grpo_openpi_pi05_8env_group8_rollout4_100step_seed42_gbs128_mb8_lr1e6
+    experiment_name: libero_spatial_grpo_openpi_pi05_8env_group4_rollout4_100step_seed42_gbs128_mb8_lr1e6
     logger_backends:
     - tensorboard
   max_epochs: 100
@@ -33,7 +33,7 @@ runner:
 algorithm:
   normalize_advantages: true
   kl_penalty: kl
-  group_size: 8
+  group_size: 4
   reward_coef: 1.0
   reward_type: chunk_level
   logprob_type: chunk_level
