@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import time
 from functools import partial
 from typing import Optional
@@ -120,6 +121,55 @@ def process_nested_dict_for_train(nested_dict, shuffle_id):
         elif isinstance(value, dict):
             ret_dict[key] = process_nested_dict_for_train(value, shuffle_id)
     return ret_dict
+
+
+def _shape_summary(value):
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        return {
+            "shape": tuple(value.shape),
+            "dtype": str(value.dtype),
+            "device": str(value.device),
+        }
+    if isinstance(value, DTensor):
+        return {
+            "shape": tuple(value.shape),
+            "dtype": str(value.dtype),
+            "device": "DTensor",
+        }
+    if isinstance(value, dict):
+        return {key: _shape_summary(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return {
+            "type": type(value).__name__,
+            "len": len(value),
+            "items": [_shape_summary(item) for item in value[:3]],
+        }
+    if isinstance(value, (bool, int, float, str)):
+        return value
+    return type(value).__name__
+
+
+def _trace_actor_shapes(worker, label: str, data) -> None:
+    if os.environ.get("RLINF_TRACE_ACTOR_SHAPES") != "1":
+        return
+    if getattr(worker, "_rank", 0) != 0:
+        return
+    worker.log_info(f"[actor-shape-trace] {label}: {_shape_summary(data)}")
+
+
+def _trace_actor_shapes_once(worker, label: str, data) -> None:
+    if os.environ.get("RLINF_TRACE_ACTOR_SHAPES") != "1":
+        return
+    if getattr(worker, "_rank", 0) != 0:
+        return
+    seen_labels = getattr(worker, "_actor_shape_trace_seen_labels", set())
+    if label in seen_labels:
+        return
+    seen_labels.add(label)
+    worker._actor_shape_trace_seen_labels = seen_labels
+    _trace_actor_shapes(worker, label, data)
 
 
 class FSDPActor(FSDPModelManager, Worker):
@@ -1306,11 +1356,24 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         g = torch.Generator()
         g.manual_seed(self.cfg.actor.seed + self._rank)
         shuffle_id = torch.randperm(rollout_size, generator=g)
+        _trace_actor_shapes(
+            self,
+            "run_training/before_flatten",
+            {
+                "rollout_size": rollout_size,
+                "rollout_batch": self.rollout_batch,
+            },
+        )
 
         with torch.no_grad():
             self.rollout_batch = process_nested_dict_for_train(
                 self.rollout_batch, shuffle_id
             )
+        _trace_actor_shapes(
+            self,
+            "run_training/after_flatten",
+            self.rollout_batch,
+        )
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
@@ -1321,12 +1384,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         )
         metrics = {}
         update_epoch = self.cfg.algorithm.get("update_epoch", 1)
-        for _ in range(update_epoch):
+        for update_epoch_idx in range(update_epoch):
             rollout_dataloader_iter = split_dict_to_chunk(
                 self.rollout_batch,
                 rollout_size // batch_size_per_rank,
             )
-            for train_global_batch in rollout_dataloader_iter:
+            for train_batch_idx, train_global_batch in enumerate(
+                rollout_dataloader_iter
+            ):
                 # split batch into micro_batches
                 train_global_batch_size = train_global_batch["prev_logprobs"].shape[0]
                 assert (
@@ -1337,11 +1402,36 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 assert train_global_batch_size % self.cfg.actor.micro_batch_size == 0, (
                     f"{train_global_batch_size=}, {self.cfg.actor.micro_batch_size}"
                 )
+                if update_epoch_idx == 0 and train_batch_idx == 0:
+                    _trace_actor_shapes(
+                        self,
+                        "run_training/train_global_batch",
+                        {
+                            "update_epoch_idx": update_epoch_idx,
+                            "train_batch_idx": train_batch_idx,
+                            "train_global_batch_size": train_global_batch_size,
+                            "batch_size_per_rank": batch_size_per_rank,
+                            "train_global_batch": train_global_batch,
+                        },
+                    )
 
                 train_micro_batch = split_dict_to_chunk(
                     train_global_batch,
                     train_global_batch_size // self.cfg.actor.micro_batch_size,
                 )
+                if update_epoch_idx == 0 and train_batch_idx == 0:
+                    _trace_actor_shapes(
+                        self,
+                        "run_training/micro_batch_list",
+                        {
+                            "num_micro_batches": len(train_micro_batch),
+                            "gradient_accumulation": self.gradient_accumulation,
+                            "micro_batch_size": self.cfg.actor.micro_batch_size,
+                            "first_micro_batch": train_micro_batch[0]
+                            if train_micro_batch
+                            else None,
+                        },
+                    )
 
                 self.optimizer.zero_grad()
                 for idx, batch in enumerate(train_micro_batch):
@@ -1383,6 +1473,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         is_last: bool,
     ) -> None:
         micro_batch = put_tensor_device(micro_batch, self.device)
+        _trace_actor_shapes_once(self, "train_micro_batch/input", micro_batch)
         backward_ctx = self.before_micro_batch(self.model, is_last_micro_batch=is_last)
         advantages = micro_batch["advantages"]
         prev_logprobs = micro_batch["prev_logprobs"]
@@ -1417,6 +1508,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 use_cache=False,
                 **kwargs,
             )
+        _trace_actor_shapes_once(self, "train_micro_batch/output_dict", output_dict)
 
         if SupportedModel(self.cfg.actor.model.model_type) in [
             SupportedModel.GR00T,
